@@ -135,7 +135,7 @@ int main()
 
         for(int i = 0; i < (1<<10); ++i)
         {
-            // request
+            // uring request
             {
                 sqentriesptr[0].off = i<<20;
                 unsigned const tail = reinterpret_cast<cuda::std::atomic_uint&>(*request.tail);
@@ -148,7 +148,7 @@ int main()
                 request.array[tail & *request.ring_mask] = 0;
                 reinterpret_cast<cuda::std::atomic_uint&>(*request.tail) = (tail + 1);
             }
-            // response
+            // uring response
             {
                 unsigned const head = reinterpret_cast<cuda::std::atomic_uint&>(*response.head);
                 while(1)
@@ -161,9 +161,10 @@ int main()
                     assert(0);
                 }
                 reinterpret_cast<cuda::std::atomic_uint&>(*response.head) = (head + 1);
-                for(auto b : buff)
-                    sum += b;
             }
+            // summation
+            for(auto b : buff)
+                sum += b;
         }
     };
 
@@ -182,7 +183,7 @@ int main()
     check(cudaHostUnregister(sqentriesptr));
     check(cudaHostUnregister(cqptr));
     __sys_io_uring_register(ioring_fd,  IORING_UNREGISTER_FILES, &_infd, 1);
-    
+
     close(infd);
     close(ioring_fd);
 
