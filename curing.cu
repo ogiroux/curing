@@ -17,6 +17,9 @@
 #include <cuda/std/atomic>
 #include <cuda/std/semaphore>
 
+//#define KERNEL_POLLING
+//#define REGISTER_FILES
+
 # define check(ans) { assert_((ans), __FILE__, __LINE__); }
 inline void assert_(cudaError_t code, const char *file, int line) {
   if (code == cudaSuccess)
@@ -54,7 +57,7 @@ namespace cuda
         unsigned *array;
     };
 
-    struct app_cq_ring {http://cuda-repo/release-candidates/kitpicks/cuda-r11-0/11.0.1/023/local_installers/cuda_11.0.1_450.36.04_linux_ppc64le.run
+    struct app_cq_ring {
         unsigned *head;
         unsigned *tail;
         unsigned *ring_mask;
@@ -66,22 +69,21 @@ namespace cuda
     __managed__ app_cq_ring response;
     __managed__ io_uring_sqe* sqentriesptr;
     __managed__ iovec vec;
+    __managed__ std::atomic_uint counts = ATOMIC_VAR_INIT(0);
 //    __managed__ std::binary_semaphore lock;
 
     struct syscall_tunnel
     {
-        std::atomic_bool done = {false};
-
         ::std::thread helper;
 
         syscall_tunnel()
         {
             io_uring_params p;
             ::std::memset(&p, 0, sizeof(p));
-
+#ifdef KERNEL_POLLING
             p.flags |= IORING_SETUP_SQPOLL;
             p.sq_thread_idle = 1000000;
-
+#endif
             ioring_fd = __sys_io_uring_setup(ioring_size, &p);
             if(ioring_fd < 0) {
                 ::std::cout << "Error in setup : " << errno << ::std::endl;
@@ -121,23 +123,35 @@ namespace cuda
             };
 
             helper = ::std::thread([&](){
-                while(!done) {
+                unsigned const& tail = reinterpret_cast<std::atomic_uint&>(*request.tail);
+                unsigned const& head = reinterpret_cast<std::atomic_uint&>(*request.head);
+                while(1) {
+#ifdef KERNEL_POLLING
                     if (reinterpret_cast<std::atomic_uint&>(*request.flags) & IORING_SQ_NEED_WAKEUP)
                         __sys_io_uring_enter(ioring_fd, 1, 0, IORING_ENTER_SQ_WAKEUP, NULL);
-                    ::std::this_thread::sleep_for(::std::chrono::milliseconds(10));
+#else
+                    auto x = counts.exchange(0, cuda::std::memory_order_relaxed);
+                    if(x == ~0u)
+                        break;
+                    if(x != 0)
+                        __sys_io_uring_enter(ioring_fd, x, 0, 0, NULL);
+                    else
+                        counts.wait(0, cuda::std::memory_order_relaxed);
+#endif
                 }
             });
         }
 
         ~syscall_tunnel()
         {
-            done = true;
+            counts = ~0u;
             helper.join();
             close(ioring_fd);
         }
-
+#ifdef REGISTER_FILES
         ::std::map<int, int> fds;
         ::std::vector<int> registry;
+#endif
     };
 
     syscall_tunnel t;
@@ -153,7 +167,7 @@ namespace cuda
     {
         int const _infd = ::open(name, opt);
         assert(_infd > 0);
-
+#ifdef REGISTER_FILES
         if(!t.registry.empty())
             __sys_io_uring_register(ioring_fd,  IORING_UNREGISTER_FILES, 0, 0);
 
@@ -165,13 +179,21 @@ namespace cuda
 
         t.fds[infd] = _infd;
         return infd;
+#else
+        return _infd;
+#endif
     }
 
     void close(int infd)
     {
+#ifdef REGISTER_FILES
         int _infd = t.fds[infd];
+        // Nope
         //__sys_io_uring_register(ioring_fd,  IORING_UNREGISTER_FILES, &_infd, 1);
         ::close(_infd);
+#else
+        ::close(infd);
+#endif
     }
 
     __host__ __device__ size_t fread(void * ptr, size_t size, size_t count, FILE * stream) {
@@ -184,7 +206,9 @@ namespace cuda
             vec = iovec{ ptr, size * count };
             sqentriesptr[0].addr = (uint64_t)&vec;
             sqentriesptr[0].len = 1;
+#ifdef REGISTER_FILES
             sqentriesptr[0].flags = IOSQE_FIXED_FILE;
+#endif
             sqentriesptr[0].off = stream->read_off;
             unsigned const tail = reinterpret_cast<std::atomic_uint&>(*request.tail);
             while(1)
@@ -196,6 +220,9 @@ namespace cuda
             request.array[tail & *request.ring_mask] = 0;
             reinterpret_cast<std::atomic_uint&>(*request.tail) = (tail + 1);
         }
+#ifndef KERNEL_POLLING
+        counts.fetch_add(1, cuda::std::memory_order_relaxed);
+#endif
         // uring response
         {
             unsigned const head = reinterpret_cast<std::atomic_uint&>(*response.head);
@@ -215,9 +242,7 @@ namespace cuda
         return count;
     };
 
-
-
-    __host__ size_t fwrite(void const * ptr, size_t size, size_t count, FILE * stream) {
+    __host__ __device__ size_t fwrite(void const * ptr, size_t size, size_t count, FILE * stream) {
 //        lock.acquire();
         // uring request
         {
@@ -227,7 +252,9 @@ namespace cuda
             vec = iovec{ (void*)ptr, size * count };
             sqentriesptr[0].addr = (uint64_t)&vec;
             sqentriesptr[0].len = 1;
+#ifdef REGISTER_FILES
             sqentriesptr[0].flags = IOSQE_FIXED_FILE;
+#endif
             sqentriesptr[0].off = stream->write_off;
             unsigned const tail = reinterpret_cast<std::atomic_uint&>(*request.tail);
             while(1)
@@ -239,6 +266,9 @@ namespace cuda
             request.array[tail & *request.ring_mask] = 0;
             reinterpret_cast<std::atomic_uint&>(*request.tail) = (tail + 1);
         }
+#ifndef KERNEL_POLLING
+        counts.fetch_add(1, cuda::std::memory_order_relaxed);
+#endif
         // uring response
         {
             unsigned const head = reinterpret_cast<std::atomic_uint&>(*response.head);
@@ -249,7 +279,6 @@ namespace cuda
                     break;
             }
             if(response.array[head & *response.ring_mask].res < 0) {
-                ::std::cout << response.array[head & *response.ring_mask].res << ::std::endl;
                 assert(0);
             }
             reinterpret_cast<std::atomic_uint&>(*response.head) = (head + 1);
@@ -258,11 +287,6 @@ namespace cuda
 //        lock.release();
         return count;
     };
-
-
-
-
-
 }
 
 __managed__ uint32_t sum;
