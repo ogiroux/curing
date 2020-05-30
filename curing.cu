@@ -413,7 +413,8 @@ int main()
 
     sum = 0;
 //    run(inner);
-    std::cout << "GPU sum: " << std::dec << sum << std::endl;
+//    std::cout << "GPU sum: " << std::dec << sum << std::endl;
+    std::cout << "GPU sum: disabled" << std::endl;
 
 #ifdef CUDA_REGISTER
     check(cudaHostUnregister(sqptr));
