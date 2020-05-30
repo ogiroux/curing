@@ -19,6 +19,7 @@
 
 //#define KERNEL_POLLING
 //#define REGISTER_FILES
+//#define CUDA_REGISTER
 
 # define check(ans) { assert_((ans), __FILE__, __LINE__); }
 inline void assert_(cudaError_t code, const char *file, int line) {
@@ -95,7 +96,9 @@ namespace cuda
                                         PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE,
                                         ioring_fd, IORING_OFF_SQ_RING);
             assert(sqptr != MAP_FAILED);
-        //    check(cudaHostRegister(sqptr, p.sq_off.array + p.sq_entries * sizeof(__u32), cudaHostRegisterDefault));
+#ifdef CUDA_REGISTER
+            check(cudaHostRegister(sqptr, p.sq_off.array + p.sq_entries * sizeof(__u32), cudaHostRegisterDefault));
+#endif
             request = app_sq_ring{
                 (unsigned *)(sqptr + p.sq_off.head),
                 (unsigned *)(sqptr + p.sq_off.tail),
@@ -108,13 +111,16 @@ namespace cuda
                                         PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE,
                                         ioring_fd, IORING_OFF_SQES);
             assert(sqentriesptr != MAP_FAILED);
-        //    check(cudaHostRegister(sqentriesptr, p.sq_entries * sizeof(io_uring_sqe), cudaHostRegisterDefault));
-
+#ifdef CUDA_REGISTER
+            check(cudaHostRegister(sqentriesptr, p.sq_entries * sizeof(io_uring_sqe), cudaHostRegisterDefault));
+#endif
             auto const cqptr = (__u8*)mmap(0, p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe),
                                 PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ioring_fd,
                                 IORING_OFF_CQ_RING);
             assert(cqptr != MAP_FAILED);
-        //    check(cudaHostRegister(cqptr, p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe), cudaHostRegisterDefault));
+#ifdef CUDA_REGISTER
+            check(cudaHostRegister(cqptr, p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe), cudaHostRegisterDefault));
+#endif
             response = app_cq_ring{
                 (unsigned *)(cqptr + p.cq_off.head),
                 (unsigned *)(cqptr + p.cq_off.tail),
@@ -196,6 +202,93 @@ namespace cuda
 #endif
     }
 
+    __managed__ char fopenbuf[1024];
+
+    __host__ __device__ FILE fopen(const char * filename, int flags, mode_t mode = 0) {
+//        lock.acquire();
+        // uring request
+        {
+            char const* sentinel = filename;
+            while(*++sentinel);
+            memcpy(fopenbuf, filename, sentinel - filename + 1);
+            ::std::memset(sqentriesptr+0, 0, sizeof(io_uring_sqe));
+            sqentriesptr[0].fd = AT_FDCWD;
+            sqentriesptr[0].opcode = IORING_OP_OPENAT;
+            sqentriesptr[0].open_flags = flags;
+            sqentriesptr[0].addr = (unsigned long)fopenbuf;
+            sqentriesptr[0].len = mode;
+            unsigned const tail = reinterpret_cast<std::atomic_uint&>(*request.tail);
+            while(1)
+            {
+                unsigned const head = reinterpret_cast<std::atomic_uint&>(*request.head);
+                if(head != ((tail + 1) ))
+                    break;
+            }
+            request.array[tail & *request.ring_mask] = 0;
+            reinterpret_cast<std::atomic_uint&>(*request.tail) = (tail + 1);
+        }
+#ifndef KERNEL_POLLING
+        counts.fetch_add(1, cuda::std::memory_order_relaxed);
+#endif
+        // uring response
+        int fd;
+        {
+            unsigned const head = reinterpret_cast<std::atomic_uint&>(*response.head);
+            while(1)
+            {
+                unsigned const tail = reinterpret_cast<std::atomic_uint&>(*response.tail);
+                if(head != tail)
+                    break;
+            }
+            auto x = response.array[head & *response.ring_mask].res;
+            if(x < 0) {
+                printf("error: %i\n", x);
+                assert(0);
+            }
+            fd = x;
+            reinterpret_cast<std::atomic_uint&>(*response.head) = (head + 1);
+        }
+        return FILE{ fd, 0 , 0 };
+    };
+
+    __host__ __device__ void fclose(FILE * file) {
+//        lock.acquire();
+        // uring request
+        {
+            ::std::memset(sqentriesptr+0, 0, sizeof(io_uring_sqe));
+            sqentriesptr[0].fd = file->fd;
+            sqentriesptr[0].opcode = IORING_OP_CLOSE;
+            unsigned const tail = reinterpret_cast<std::atomic_uint&>(*request.tail);
+            while(1)
+            {
+                unsigned const head = reinterpret_cast<std::atomic_uint&>(*request.head);
+                if(head != ((tail + 1) ))
+                    break;
+            }
+            request.array[tail & *request.ring_mask] = 0;
+            reinterpret_cast<std::atomic_uint&>(*request.tail) = (tail + 1);
+        }
+#ifndef KERNEL_POLLING
+        counts.fetch_add(1, cuda::std::memory_order_relaxed);
+#endif
+        // uring response
+        {
+            unsigned const head = reinterpret_cast<std::atomic_uint&>(*response.head);
+            while(1)
+            {
+                unsigned const tail = reinterpret_cast<std::atomic_uint&>(*response.tail);
+                if(head != tail)
+                    break;
+            }
+            auto x = response.array[head & *response.ring_mask].res;
+            if(x < 0) {
+                printf("error: %i\n", x);
+                assert(0);
+            }
+            reinterpret_cast<std::atomic_uint&>(*response.head) = (head + 1);
+        }
+    };
+
     __host__ __device__ size_t fread(void * ptr, size_t size, size_t count, FILE * stream) {
 //        lock.acquire();
         // uring request
@@ -232,7 +325,9 @@ namespace cuda
                 if(head != tail)
                     break;
             }
-            if(response.array[head & *response.ring_mask].res < 0) {
+            auto x = response.array[head & *response.ring_mask].res;
+            if(x < 0) {
+                printf("error: %i\n", x);
                 assert(0);
             }
             reinterpret_cast<std::atomic_uint&>(*response.head) = (head + 1);
@@ -278,7 +373,9 @@ namespace cuda
                 if(head != tail)
                     break;
             }
-            if(response.array[head & *response.ring_mask].res < 0) {
+            auto x = response.array[head & *response.ring_mask].res;
+            if(x < 0) {
+                printf("error: %i\n", x);
                 assert(0);
             }
             reinterpret_cast<std::atomic_uint&>(*response.head) = (head + 1);
@@ -294,33 +391,35 @@ __managed__ uint32_t buff[1<<18];
 
 int main()
 {
-    int infd0 = cuda::open("myfile", O_RDONLY);
-    int infd1 = cuda::open("/dev/tty", O_WRONLY);
-    auto inner = [infd0, infd1] __host__ __device__ () {
-        cuda::FILE file0 = { infd0, 0 , 0 };
+    auto inner = [] __host__ __device__ () {
+
+        auto file0 = cuda::fopen("myfile", O_RDONLY);
         for(int i = 0; i < (1<<10); ++i)
         {
             cuda::fread(buff, 1, 1<<20, &file0);
             for(auto b : buff)
                 sum += b;
         }
-        cuda::FILE file1 = { infd1, 0 , 0 };
-        cuda::fwrite("It worked!\n", 1, 11, &file1);
+        cuda::fclose(&file0);
+
+        memcpy(buff, "It worked!\n", 11);
+        cuda::FILE STDOUT = {1, 0, 0};
+        cuda::fwrite(buff, 1, 11, &STDOUT);
     };
 
     sum = 0;
     inner();
     std::cout << "CPU sum: " << std::dec << sum << std::endl;
 
-//    sum = 0;
+    sum = 0;
 //    run(inner);
-//    std::cout << "GPU sum: " << std::dec << sum << std::endl;
+    std::cout << "GPU sum: " << std::dec << sum << std::endl;
 
-//    check(cudaHostUnregister(sqptr));
-//    check(cudaHostUnregister(sqentriesptr));
-//    check(cudaHostUnregister(cqptr));
+#ifdef CUDA_REGISTER
+    check(cudaHostUnregister(sqptr));
+    check(cudaHostUnregister(sqentriesptr));
+    check(cudaHostUnregister(cqptr));
+#endif
 
-    cuda::close(infd0);
-    cuda::close(infd1);
     return 0;
 }
