@@ -71,7 +71,8 @@ namespace cuda
     __managed__ io_uring_sqe* sqentriesptr;
     __managed__ iovec vec;
     __managed__ std::atomic_uint counts = ATOMIC_VAR_INIT(0);
-//    __managed__ std::binary_semaphore lock;
+
+    __u8 *sqptr, *cqptr;
 
     struct syscall_tunnel
     {
@@ -92,7 +93,7 @@ namespace cuda
             }
 
             check(cudaGetLastError());
-            auto const sqptr = (__u8*)mmap(0, p.sq_off.array + p.sq_entries * sizeof(__u32),
+            sqptr = (__u8*)mmap(0, p.sq_off.array + p.sq_entries * sizeof(__u32),
                                         PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE,
                                         ioring_fd, IORING_OFF_SQ_RING);
             assert(sqptr != MAP_FAILED);
@@ -114,7 +115,7 @@ namespace cuda
 #ifdef CUDA_REGISTER
             check(cudaHostRegister(sqentriesptr, p.sq_entries * sizeof(io_uring_sqe), cudaHostRegisterDefault));
 #endif
-            auto const cqptr = (__u8*)mmap(0, p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe),
+            cqptr = (__u8*)mmap(0, p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe),
                                 PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, ioring_fd,
                                 IORING_OFF_CQ_RING);
             assert(cqptr != MAP_FAILED);
@@ -153,6 +154,11 @@ namespace cuda
             counts = ~0u;
             helper.join();
             close(ioring_fd);
+#ifdef CUDA_REGISTER
+            check(cudaHostUnregister(sqptr));
+            check(cudaHostUnregister(sqentriesptr));
+            check(cudaHostUnregister(cqptr));
+#endif
         }
 #ifdef REGISTER_FILES
         ::std::map<int, int> fds;
@@ -194,8 +200,6 @@ namespace cuda
     {
 #ifdef REGISTER_FILES
         int _infd = t.fds[infd];
-        // Nope
-        //__sys_io_uring_register(ioring_fd,  IORING_UNREGISTER_FILES, &_infd, 1);
         ::close(_infd);
 #else
         ::close(infd);
@@ -205,7 +209,6 @@ namespace cuda
     __managed__ char fopenbuf[1024];
 
     __host__ __device__ FILE fopen(const char * filename, int flags, mode_t mode = 0) {
-//        lock.acquire();
         // uring request
         {
             char const* sentinel = filename;
@@ -252,7 +255,6 @@ namespace cuda
     };
 
     __host__ __device__ void fclose(FILE * file) {
-//        lock.acquire();
         // uring request
         {
             ::std::memset(sqentriesptr+0, 0, sizeof(io_uring_sqe));
@@ -290,7 +292,6 @@ namespace cuda
     };
 
     __host__ __device__ size_t fread(void * ptr, size_t size, size_t count, FILE * stream) {
-//        lock.acquire();
         // uring request
         {
             ::std::memset(sqentriesptr+0, 0, sizeof(io_uring_sqe));
@@ -333,12 +334,10 @@ namespace cuda
             reinterpret_cast<std::atomic_uint&>(*response.head) = (head + 1);
         }
         stream->read_off += size * count;
-//        lock.release();
         return count;
     };
 
     __host__ __device__ size_t fwrite(void const * ptr, size_t size, size_t count, FILE * stream) {
-//        lock.acquire();
         // uring request
         {
             ::std::memset(sqentriesptr+0, 0, sizeof(io_uring_sqe));
@@ -381,7 +380,6 @@ namespace cuda
             reinterpret_cast<std::atomic_uint&>(*response.head) = (head + 1);
         }
         stream->write_off += size * count;
-//        lock.release();
         return count;
     };
 }
@@ -412,15 +410,9 @@ int main()
     std::cout << "CPU sum: " << std::dec << sum << std::endl;
 
     sum = 0;
-//    run(inner);
-//    std::cout << "GPU sum: " << std::dec << sum << std::endl;
-    std::cout << "GPU sum: disabled" << std::endl;
-
-#ifdef CUDA_REGISTER
-    check(cudaHostUnregister(sqptr));
-    check(cudaHostUnregister(sqentriesptr));
-    check(cudaHostUnregister(cqptr));
-#endif
+    run(inner);
+    std::cout << "GPU sum: " << std::dec << sum << std::endl;
+//    std::cout << "GPU sum: disabled" << std::endl;
 
     return 0;
 }
