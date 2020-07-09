@@ -1,6 +1,6 @@
 # curing
 
-Build with `./make.sh`. You need to have CUDA 10.2 or better, Linux 5.3 or better.
+Build with `./make.sh`. You need to have CUDA 10.2 or better, Linux 5.6 or better.
 
 Create the 1GB test file with `./create_file.sh`. ***Remember to delete it later!***
 
